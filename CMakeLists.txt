@@ -23,6 +23,7 @@ endif()
 # ============================================================
 add_library(rtf2html
   src/codepage.cpp
+  src/codepage_dbcs.cpp
   src/tokenizer.cpp
   src/converter.cpp
   src/rtf2html.cpp

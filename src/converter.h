@@ -77,6 +77,33 @@ private:
     int currentListLevel_ = 0;                      // 正在解析的列表级别
     ListOverride currentOverride_;                  // 正在解析的列表覆盖
 
+    // -------- 样式表（Feature 2）--------
+    std::map<int, StyleEntry> styleTable_;          // 样式表
+    StyleEntry currentStyle_;                       // 正在解析的样式条目
+    bool parsingStyle_ = false;                     // 是否在解析样式条目
+    std::string styleNameBuffer_;                   // 样式名称缓冲
+
+    // -------- DBCS 状态（Feature 1）--------
+    uint8_t dbcsLeadByte_ = 0;          // DBCS 前导字节缓冲（0表示无待处理）
+
+    // -------- 非组形式 htmlrtf（Feature 3）--------
+    bool htmlRtfInlineSkip_ = false;    // 非组形式 \htmlrtf 跳过标志
+
+    // -------- 脚注/尾注（Feature 10）--------
+    std::vector<std::string> footnotes_;    // 收集的脚注 HTML
+    std::vector<std::string> endnotes_;     // 收集的尾注 HTML
+    std::string footnoteBuffer_;            // 正在收集的脚注内容
+    int footnoteCounter_ = 0;              // 脚注计数器
+    bool collectingFootnote_ = false;       // 是否正在收集脚注
+    bool inFootnote_ = false;              // 是否在脚注组内
+
+    // -------- 书签（Feature 20）--------
+    std::string bookmarkNameBuffer_;        // 书签名称缓冲
+
+    // -------- 段节（Feature 17）--------
+    int sectionCols_ = 0;                  // 当前节的列数
+    bool inSection_ = false;               // 是否在多列节中
+
     // -------- 图片状态 --------
     struct PictState {
         std::string hexData;          // 十六进制数据
@@ -120,11 +147,19 @@ private:
         std::string currentCellContent;         // 当前单元格内容
         bool inCell = false;                    // 是否在单元格内
         int cellIndex = 0;                      // 当前单元格索引
+        // 表格对齐（Feature 16）
+        int align = 0;                          // 0=左, 1=居中, 2=右
+        // 嵌套支持（Feature 5）
+        int itap = 1;                           // \itap 值：表格嵌套层级
     } table_;
+
+    // 嵌套表格栈（Feature 5）
+    std::vector<TableState> tableStack_;        // 嵌套表格状态栈
 
     // -------- HTML 输出 --------
     std::ostringstream html_;       // 主 HTML 输出流
     bool paraOpen_ = false;         // 是否有未关闭的段落
+    std::string currentParaTag_ = "p"; // 当前段落标签名（p/h1/h2 等）（Feature 2）
     std::string currentSpanCss_;    // 当前打开的 span 的 CSS
     bool spanOpen_ = false;         // 是否有打开的 span
 
@@ -178,8 +213,15 @@ private:
 
     void emitPict();
     static std::string toBase64(const std::vector<uint8_t>& data);
+    static std::vector<uint8_t> dibToPng(const std::vector<uint8_t>& dibData); // Feature 7
+    static std::vector<uint8_t> hexToBinary(const std::string& hex);
 
     static std::string extractHyperlink(const std::string& instText);
+    static std::string extractFieldContent(const std::string& instText,
+                                            std::string& fieldType); // Feature 12
+
+    // 脚注方法（Feature 10）
+    void emitFootnotes();
 
     void writeToCurrentOutput(const std::string& s);
 

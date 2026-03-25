@@ -87,6 +87,27 @@ struct CharState {
     int lang = 0;               // 语言
     int fontCharset = 0;        // 当前字体字符集
     int fontCodepage = 1252;    // 当前字体代码页
+    // 特殊文字效果（Feature 14）
+    bool outline = false;       // \outl 空心字
+    bool shadow = false;        // \shad 阴影
+    bool emboss = false;        // \embo 浮雕
+    bool engrave = false;       // \impr 雕刻
+    // 文字方向（Feature 9）
+    bool rtl = false;           // \rtlch 从右到左字符运行
+};
+
+// ============================================================
+// 段落边框（Feature 8）
+// ============================================================
+struct ParaBorder {
+    bool left = false;          // 左边框
+    bool right = false;         // 右边框
+    bool top = false;           // 上边框
+    bool bottom = false;        // 下边框
+    bool box = false;           // 整体框线
+    int style = 0;              // 0=单线, 1=粗线, 2=双线, 3=点线, 4=虚线
+    int width = 15;             // 边框宽度（twips）
+    int colorIndex = 0;         // 边框颜色索引
 };
 
 // ============================================================
@@ -105,6 +126,18 @@ struct ParaState {
     int listSelector = 0;       // \ls 值
     int listLevel = 0;          // \ilvl 值
     int styleIndex = 0;         // 样式索引
+    // 文字方向（Feature 9）
+    bool rtlPar = false;        // \rtlpar 段落从右到左
+    // 分页（Feature 11）
+    bool pageBreakBefore = false; // \pagebb 段前分页
+    // 段落边框（Feature 8）
+    ParaBorder border;
+    // 段落底纹（Feature 15）
+    int shadingPct = 0;         // \shading 百分比
+    int shadingFgColor = 0;     // \cfpat 前景色索引
+    int shadingBgColor = 0;     // \cbpat 背景色索引
+    // 列节（Feature 17）
+    int outlineLevel = -1;      // \outlinelevel 值（0=H1, 1=H2...）
 };
 
 // ============================================================
@@ -131,12 +164,30 @@ enum class Destination {
     HtmlRtf,            // \*\htmlrtf - 有 fromhtml 时跳过
     MhtmlTag,           // \*\mhtmltag
     Bookmark,           // 书签
+    BookmarkStart,      // \bkmkstart - 书签开始（Feature 20）
+    BookmarkEnd,        // \bkmkend - 书签结束（Feature 20）
     Shape,              // 图形
     ShapeInst,          // 图形实例
     ShapePict,          // 图形图片
+    ShapeText,          // \shptxt - 图形文本框内容（Feature 13）
     Header,             // 页眉
     Footer,             // 页脚
+    Footnote,           // 脚注（Feature 10）
+    Endnote,            // 尾注（Feature 10）
     Skip,               // 未知可选目标 - 忽略
+};
+
+// ============================================================
+// 样式表条目（Feature 2）
+// ============================================================
+struct StyleEntry {
+    int index = 0;              // 样式索引
+    std::string name;           // 样式名称
+    bool isCharStyle = false;   // cs = 字符样式
+    bool isParaStyle = false;   // s = 段落样式
+    int basedOn = 0;            // \sbasedon 基础样式
+    int next = 0;               // \snext 下一样式
+    int outlineLevel = -1;      // \outlinelevel（0=H1, 1=H2...）
 };
 
 // ============================================================

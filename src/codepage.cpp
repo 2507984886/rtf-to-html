@@ -417,4 +417,23 @@ int fcharsetToCodepage(int fcharset) {
     }
 }
 
+// ============================================================
+// DBCS 前导字节判断（Feature 1）
+// ============================================================
+bool isDbcsLeadByte(uint8_t byte, int codepage) {
+    switch (codepage) {
+        case 932: // Shift-JIS
+            return (byte >= 0x81 && byte <= 0x9F) ||
+                   (byte >= 0xE0 && byte <= 0xFC);
+        case 936: // GBK
+            return (byte >= 0x81 && byte <= 0xFE);
+        case 949: // 韩语
+            return (byte >= 0x81 && byte <= 0xFE);
+        case 950: // Big5
+            return (byte >= 0x81 && byte <= 0xFE);
+        default:
+            return false;
+    }
+}
+
 } // namespace rtf2html

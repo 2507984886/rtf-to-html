@@ -36,4 +36,21 @@ std::string utf32ToUtf8(uint32_t codepoint);
  */
 int fcharsetToCodepage(int fcharset);
 
+/**
+ * 判断字节是否为 DBCS 前导字节（Feature 1）
+ * @param byte      字节值
+ * @param codepage  代码页（932=Shift-JIS, 936=GBK, 949=Korean, 950=Big5）
+ * @return          true 表示是前导字节
+ */
+bool isDbcsLeadByte(uint8_t byte, int codepage);
+
+/**
+ * DBCS 双字节对转 UTF-8（Feature 1）
+ * @param lead      前导字节
+ * @param trail     跟随字节
+ * @param codepage  代码页
+ * @return          UTF-8 编码的字符串（失败返回替换字符）
+ */
+std::string dbcsPairToUtf8(uint8_t lead, uint8_t trail, int codepage);
+
 } // namespace rtf2html

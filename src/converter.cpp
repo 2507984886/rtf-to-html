@@ -1,11 +1,14 @@
 // converter.cpp - RTF 到 HTML 转换器核心实现
 // 处理 RTF 状态机、字体/颜色表、表格、图片、列表、fromhtml 模式
+// 支持 DBCS 多字节编码、样式表、脚注、书签等高级特性
 
 #include "converter.h"
 #include "codepage.h"
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstdint>
+#include <cstring>
 #include <iomanip>
 #include <sstream>
 #include <stdexcept>
@@ -75,6 +78,15 @@ ConvertResult Converter::convert() {
             closeAllLists();
         }
 
+        // 关闭多列节（Feature 17）
+        if (inSection_) {
+            html_ << "</div>\n";
+            inSection_ = false;
+        }
+
+        // 输出脚注区（Feature 10）
+        emitFootnotes();
+
         if (opts_.generateFullPage) {
             html_ << "\n</body>\n</html>";
         }
@@ -141,6 +153,11 @@ void Converter::handleGroupStart() {
         curState_.dest == Destination::Footer) {
         curState_.skipGroup = true;
     }
+    // 在脚注组内，子组也保持脚注状态
+    if (curState_.dest == Destination::Footnote ||
+        curState_.dest == Destination::Endnote) {
+        // 不重置，保持继续收集脚注内容
+    }
 }
 
 // ============================================================
@@ -165,27 +182,48 @@ void Converter::handleGroupEnd() {
             break;
 
         case Destination::FieldResult: {
-            // 域结果结束：如果有超链接，将已输出的内容包裹
-            // 简化处理：已在 FieldResult 目标的文本中直接输出
+            // 域结果结束
             field_.inResult = false;
             break;
         }
 
-        case Destination::FieldInst:
-            field_.hyperlink = extractHyperlink(field_.instText);
+        case Destination::FieldInst: {
+            // 分析域内容，支持多种域类型（Feature 12）
+            std::string fieldType;
+            std::string extracted = extractFieldContent(field_.instText, fieldType);
             field_.inInst = false;
-            // 如果是超链接，立即输出 <a> 开始标签
-            if (!field_.hyperlink.empty()) {
-                std::string href = "<a href=\"" + htmlEscapeAttr(field_.hyperlink) + "\">";
-                if (!fromHtml_) {
-                    // 在普通模式下，先确保段落打开
+            if (fieldType == "HYPERLINK") {
+                field_.hyperlink = extracted;
+                if (!field_.hyperlink.empty() && !fromHtml_) {
                     if (!paraOpen_) openParagraph();
                     ensureSpanClosed();
-                    html_ << href;
+                    // 检查是否有 \l 锚点（本地链接）
+                    html_ << "<a href=\"" + htmlEscapeAttr(field_.hyperlink) + "\">";
+                    fieldAnchorOpen_ = true;
+                }
+            } else if (fieldType == "REF") {
+                // \REF 书签引用
+                if (!fromHtml_ && !extracted.empty()) {
+                    if (!paraOpen_) openParagraph();
+                    html_ << "<a href=\"#bkmk_" << htmlEscapeAttr(extracted) << "\">";
+                    fieldAnchorOpen_ = true;
+                }
+            } else if (fieldType == "INCLUDEPICTURE") {
+                // 嵌入图片
+                if (!fromHtml_ && !extracted.empty()) {
+                    std::string imgTag = "<img src=\"" + htmlEscapeAttr(extracted) + "\" alt=\"\">";
+                    writeToCurrentOutput(imgTag);
+                }
+            } else if (fieldType == "MAILTO") {
+                if (!fromHtml_ && !extracted.empty()) {
+                    if (!paraOpen_) openParagraph();
+                    html_ << "<a href=\"mailto:" << htmlEscapeAttr(extracted) << "\">";
                     fieldAnchorOpen_ = true;
                 }
             }
+            // 其他域类型（DATE, TIME, PAGE 等）在 fldrslt 中处理
             break;
+        }
 
         case Destination::HtmlTag:
             if (fromHtml_ && collectingHtmlTag_) {
@@ -200,6 +238,57 @@ void Converter::handleGroupEnd() {
                 listTable_[currentListDef_.listId] = currentListDef_;
             }
             break;
+
+        case Destination::StyleEntry:
+            // 样式条目解析完毕，存储到样式表（Feature 2）
+            if (!currentStyle_.name.empty() || currentStyle_.index > 0) {
+                styleTable_[currentStyle_.index] = currentStyle_;
+            }
+            parsingStyle_ = false;
+            styleNameBuffer_.clear();
+            break;
+
+        case Destination::Footnote: {
+            // 脚注内容收集完毕（Feature 10）
+            int n = footnoteCounter_;
+            std::string fnEntry = "<div id=\"fn_" + std::to_string(n) + "\">"
+                + "<sup>" + std::to_string(n) + "</sup> "
+                + footnoteBuffer_
+                + "</div>\n";
+            footnotes_.push_back(fnEntry);
+            footnoteBuffer_.clear();
+            collectingFootnote_ = false;
+            inFootnote_ = false;
+            break;
+        }
+
+        case Destination::Endnote: {
+            // 尾注内容收集完毕（Feature 10）
+            int n = (int)endnotes_.size() + 1;
+            std::string fnEntry = "<div id=\"en_" + std::to_string(n) + "\">"
+                + "<sup>" + std::to_string(n) + "</sup> "
+                + footnoteBuffer_
+                + "</div>\n";
+            endnotes_.push_back(fnEntry);
+            footnoteBuffer_.clear();
+            collectingFootnote_ = false;
+            break;
+        }
+
+        case Destination::BookmarkStart: {
+            // 书签开始（Feature 20）
+            if (!bookmarkNameBuffer_.empty() && !fromHtml_) {
+                // 输出锚点标签
+                std::string anchor = "<a id=\"bkmk_" + htmlEscapeAttr(bookmarkNameBuffer_) + "\"></a>";
+                if (paraOpen_ || (curState_.ps.inTable && table_.active)) {
+                    writeToCurrentOutput(anchor);
+                } else {
+                    html_ << anchor;
+                }
+                bookmarkNameBuffer_.clear();
+            }
+            break;
+        }
 
         default:
             break;
@@ -273,8 +362,8 @@ void Converter::handleControlWord(const Token& tok) {
         return;
     }
     if (name == "stylesheet") {
+        // Feature 2：样式表解析（不跳过，改为解析）
         curState_.dest = Destination::StyleSheet;
-        curState_.skipGroup = true;
         return;
     }
     if (name == "info") {
@@ -352,9 +441,19 @@ void Converter::handleControlWord(const Token& tok) {
         return;
     }
     if (name == "htmlrtf") {
-        if (fromHtml_ && curState_.optionalDest) {
-            curState_.dest = Destination::HtmlRtf;
-            curState_.skipGroup = true;
+        // Feature 3：支持组形式和非组形式 htmlrtf
+        if (fromHtml_) {
+            if (curState_.optionalDest) {
+                // 组形式：{\*\htmlrtf ...}
+                curState_.dest = Destination::HtmlRtf;
+                curState_.skipGroup = true;
+            } else if (hasParam && param == 0) {
+                // \htmlrtf0 - 结束非组跳过
+                htmlRtfInlineSkip_ = false;
+            } else {
+                // \htmlrtf（无参数或参数!=0）- 开始非组跳过
+                htmlRtfInlineSkip_ = true;
+            }
         }
         return;
     }
@@ -377,8 +476,39 @@ void Converter::handleControlWord(const Token& tok) {
         curState_.skipGroup = true;
         return;
     }
-    if (name == "bkmkstart" || name == "bkmkend") {
-        curState_.dest = Destination::Bookmark;
+    if (name == "bkmkstart") {
+        // Feature 20：书签开始
+        curState_.dest = Destination::BookmarkStart;
+        bookmarkNameBuffer_.clear();
+        return;
+    }
+    if (name == "bkmkend") {
+        // Feature 20：书签结束（不需要输出）
+        curState_.dest = Destination::BookmarkEnd;
+        return;
+    }
+    if (name == "footnote") {
+        // Feature 10：脚注
+        ++footnoteCounter_;
+        // 在当前位置输出引用标记
+        std::string ref = "<sup><a id=\"fnref_" + std::to_string(footnoteCounter_) + "\""
+            + " href=\"#fn_" + std::to_string(footnoteCounter_) + "\">"
+            + "[" + std::to_string(footnoteCounter_) + "]</a></sup>";
+        if (!fromHtml_) {
+            if (!paraOpen_) openParagraph();
+            ensureSpanClosed();
+            html_ << ref;
+        }
+        curState_.dest = Destination::Footnote;
+        footnoteBuffer_.clear();
+        collectingFootnote_ = true;
+        inFootnote_ = true;
+        return;
+    }
+    if (name == "xe" || name == "tc") {
+        // 索引条目/目录条目，忽略
+        curState_.dest = Destination::Skip;
+        curState_.skipGroup = true;
         return;
     }
 
@@ -391,6 +521,7 @@ void Converter::handleControlWord(const Token& tok) {
             "htmltag","htmlrtf","mhtmltag","shp","shpinst","shppict",
             "header","footer","bkmkstart","bkmkend","field",
             "headerl","headerr","footerl","footerr","doshpict",
+            "footnote","xe","tc","shptxt",
             ""
         };
         bool known = false;
@@ -432,10 +563,45 @@ void Converter::handleControlWord(const Token& tok) {
         case Destination::Info:
         case Destination::HtmlRtf:
         case Destination::MhtmlTag:
+        case Destination::BookmarkEnd:
+            // 跳过这些目标中的控制字
+            return;
         case Destination::StyleSheet:
+            // Feature 2：样式表内，当遇到新 { 时创建子条目
+            if (name == "s" && hasParam) {
+                // 段落样式条目开始
+                curState_.dest = Destination::StyleEntry;
+                currentStyle_ = StyleEntry{};
+                currentStyle_.index = param;
+                currentStyle_.isParaStyle = true;
+                parsingStyle_ = true;
+                styleNameBuffer_.clear();
+            } else if (name == "cs" && hasParam) {
+                // 字符样式条目开始
+                curState_.dest = Destination::StyleEntry;
+                currentStyle_ = StyleEntry{};
+                currentStyle_.index = param;
+                currentStyle_.isCharStyle = true;
+                parsingStyle_ = true;
+                styleNameBuffer_.clear();
+            }
+            return;
         case Destination::StyleEntry:
+            // Feature 2：解析样式条目中的控制字
+            if (name == "sbasedon" && hasParam) {
+                currentStyle_.basedOn = param;
+            } else if (name == "snext" && hasParam) {
+                currentStyle_.next = param;
+            } else if (name == "outlinelevel" && hasParam) {
+                currentStyle_.outlineLevel = param;
+            } else if (name == "cs" && hasParam) {
+                // 字符样式索引（在段落样式内）
+                currentStyle_.isCharStyle = true;
+            }
+            // 样式条目内的格式控制字可以忽略（仅存储 outlinelevel）
+            return;
         case Destination::ListText:
-            // 跳过字体/颜色在这些目标中的处理
+            // 跳过列表文本中的控制字
             return;
         default:
             break;
@@ -629,6 +795,48 @@ void Converter::handleCharFormatControl(const std::string& name, bool hasParam, 
     if (name == "cs") {
         cs.styleIndex = param; return;
     }
+    // Feature 14：特殊文字效果
+    if (name == "outl") {
+        maybeCloseSpan();
+        cs.outline = !hasParam || param != 0; return;
+    }
+    if (name == "outl0") {
+        maybeCloseSpan();
+        cs.outline = false; return;
+    }
+    if (name == "shad") {
+        maybeCloseSpan();
+        cs.shadow = !hasParam || param != 0; return;
+    }
+    if (name == "shad0") {
+        maybeCloseSpan();
+        cs.shadow = false; return;
+    }
+    if (name == "embo") {
+        maybeCloseSpan();
+        cs.emboss = !hasParam || param != 0; return;
+    }
+    if (name == "embo0") {
+        maybeCloseSpan();
+        cs.emboss = false; return;
+    }
+    if (name == "impr") {
+        maybeCloseSpan();
+        cs.engrave = !hasParam || param != 0; return;
+    }
+    if (name == "impr0") {
+        maybeCloseSpan();
+        cs.engrave = false; return;
+    }
+    // Feature 9：文字方向
+    if (name == "rtlch") {
+        maybeCloseSpan();
+        cs.rtl = true; return;
+    }
+    if (name == "ltrch") {
+        maybeCloseSpan();
+        cs.rtl = false; return;
+    }
 }
 
 // ============================================================
@@ -685,22 +893,107 @@ void Converter::handleParaFormatControl(const std::string& name, bool hasParam, 
         }
         return;
     }
-    if (name == "page" || name == "pagebb") {
+    if (name == "page") {
+        // Feature 11：分页符
         ensureSpanClosed();
-        closeParagraph();
-        html_ << "<div style=\"page-break-after:always\"></div>\n";
+        if (!fromHtml_) {
+            closeParagraph();
+            html_ << "<div style=\"page-break-after:always;border-top:1px dashed #ccc;margin:1em 0;\"></div>\n";
+        }
         return;
     }
-    if (name == "sect" || name == "sectd") {
+    if (name == "pagebb") {
+        // Feature 11：段前分页
+        ps.pageBreakBefore = true;
+        return;
+    }
+    if (name == "sect") {
+        // Feature 17：节分隔符
+        if (!fromHtml_) {
+            ensureSpanClosed();
+            closeParagraph();
+            if (inSection_) {
+                html_ << "</div>\n";
+                inSection_ = false;
+            }
+        }
+        return;
+    }
+    if (name == "sectd") {
+        // 节属性重置
+        sectionCols_ = 0;
+        return;
+    }
+    if (name == "cols") {
+        // Feature 17：多列
+        sectionCols_ = hasParam ? param : 1;
+        if (!fromHtml_ && sectionCols_ > 1) {
+            ensureSpanClosed();
+            closeParagraph();
+            if (inSection_) {
+                html_ << "</div>\n";
+            }
+            html_ << "<div style=\"column-count:" << sectionCols_ << ";\">\n";
+            inSection_ = true;
+        }
         return;
     }
     if (name == "s") {
         ps.styleIndex = param;
+        // Feature 2：应用样式表中的 outlinelevel
+        if (!styleTable_.empty()) {
+            auto it = styleTable_.find(param);
+            if (it != styleTable_.end()) {
+                ps.outlineLevel = it->second.outlineLevel;
+            }
+        }
+        return;
+    }
+    if (name == "outlinelevel") {
+        ps.outlineLevel = hasParam ? param : -1;
         return;
     }
     if (name == "nowidctlpar" || name == "widctlpar" ||
         name == "keepn" || name == "keep" ||
         name == "hyphpar" || name == "nohyph") {
+        return;
+    }
+    // Feature 9：段落文字方向
+    if (name == "rtlpar") {
+        ps.rtlPar = true; return;
+    }
+    if (name == "ltrpar") {
+        ps.rtlPar = false; return;
+    }
+    if (name == "rtlrow" || name == "ltrrow") {
+        return; // 表格行方向（暂忽略）
+    }
+    // Feature 8：段落边框
+    if (name == "brdrl") { ps.border.left = true; return; }
+    if (name == "brdrr") { ps.border.right = true; return; }
+    if (name == "brdrt") { ps.border.top = true; return; }
+    if (name == "brdrb") { ps.border.bottom = true; return; }
+    if (name == "box")   { ps.border.box = true; return; }
+    if (name == "brdrs") { ps.border.style = 0; return; }   // 单线
+    if (name == "brdrth"){ ps.border.style = 1; return; }   // 粗线
+    if (name == "brdrdb"){ ps.border.style = 2; return; }   // 双线
+    if (name == "brdrdot"){ ps.border.style = 3; return; }  // 点线
+    if (name == "brdrdash"){ ps.border.style = 4; return; } // 虚线
+    if (name == "brdrw") { ps.border.width = hasParam ? param : 15; return; }
+    if (name == "brdrcf") { ps.border.colorIndex = hasParam ? param : 0; return; }
+    // Feature 15：段落底纹
+    if (name == "shading") { ps.shadingPct = hasParam ? param : 0; return; }
+    if (name == "cfpat")   { ps.shadingFgColor = hasParam ? param : 0; return; }
+    if (name == "cbpat")   { ps.shadingBgColor = hasParam ? param : 0; return; }
+    // Feature 18：特殊字符
+    if (name == "softline") {
+        if (!fromHtml_) {
+            if (curState_.ps.inTable && table_.active) {
+                table_.currentCellContent += "<br>";
+            } else {
+                writeToCurrentOutput("<br>");
+            }
+        }
         return;
     }
     (void)hasParam;
@@ -709,7 +1002,7 @@ void Converter::handleParaFormatControl(const std::string& name, bool hasParam, 
 // ============================================================
 // 表格控制字处理
 // ============================================================
-void Converter::handleTableControl(const std::string& name, bool /*hasParam*/, int param) {
+void Converter::handleTableControl(const std::string& name, bool hasParam, int param) {
     if (name == "trowd") {
         if (!table_.active) startTable();
         table_.rowDef = true;
@@ -751,12 +1044,32 @@ void Converter::handleTableControl(const std::string& name, bool /*hasParam*/, i
     if (name == "trhdr")   { return; }
     if (name == "trkeep")  { return; }
     if (name == "brdrw")   { table_.currentCellDef.borderLineWidth = param; return; }
+    // Feature 16：表格对齐
+    if (name == "trql")    { table_.align = 0; return; } // 左对齐
+    if (name == "trqr")    { table_.align = 2; return; } // 右对齐
+    if (name == "trqc")    { table_.align = 1; return; } // 居中
+    // Feature 16：单元格内边距
+    if (name == "clpadl" || name == "clpadr" ||
+        name == "clpadt" || name == "clpadb") { return; } // 暂存储
+    // Feature 5：嵌套表格
+    if (name == "itap") {
+        table_.itap = hasParam ? param : 1;
+        return;
+    }
+    // 忽略其他表格控制字
+    if (name == "trgaph" || name == "trwWidth" || name == "trftsWidth" ||
+        name == "trbrdrl" || name == "trbrdrr" || name == "trbrdrt" ||
+        name == "trbrdrb" || name == "trbrdrh" || name == "trbrdrv" ||
+        name == "clshdng" || name == "clcfpat") {
+        return;
+    }
 }
 
 // ============================================================
 // 列表控制字处理
 // ============================================================
-void Converter::handleListControl(const std::string& name, bool /*hasParam*/, int param) {
+void Converter::handleListControl(const std::string& name, bool hasParam, int param) {
+    (void)hasParam;
     if (name == "listid") {
         if (curState_.dest == Destination::ListEntry) {
             currentListDef_.listId = param;
@@ -768,11 +1081,13 @@ void Converter::handleListControl(const std::string& name, bool /*hasParam*/, in
     if (name == "ls") {
         if (curState_.dest == Destination::ListOverrideEntry) {
             currentOverride_.ls = param;
+            // Feature 4：修复 listOverrideTable_ 存储逻辑
             listOverrideTable_[param] = currentOverride_;
         }
         return;
     }
     if (name == "levelnfc" || name == "levelnfcn") {
+        // Feature 4：存储列表类型
         if (!currentListDef_.levels.empty()) {
             currentListDef_.levels.back().numType = param;
         }
@@ -784,7 +1099,8 @@ void Converter::handleListControl(const std::string& name, bool /*hasParam*/, in
         }
         return;
     }
-    if (name == "listtemplateid" || name == "listid") return;
+    if (name == "listtemplateid") return;
+    // 列表级别进入时，已在 handleControlWord 主分支处理
 }
 
 // ============================================================
@@ -831,7 +1147,18 @@ void Converter::handleSpecialOutput(const std::string& name) {
     if (name == "zwnj")       { writeToCurrentOutput("&#x200C;"); return; }
     if (name == "ltrmark")    { writeToCurrentOutput("&#x200E;"); return; }
     if (name == "rtlmark")    { writeToCurrentOutput("&#x200F;"); return; }
-    if (name == "chpgn")      { writeToCurrentOutput("[PAGE]"); return; }
+    if (name == "chpgn")      { writeToCurrentOutput("<span class=\"page-num\">[PAGE]</span>"); return; }
+    // Feature 18：额外特殊字符
+    if (name == "line")       { writeToCurrentOutput("<br>"); return; }
+    if (name == "softcol")    { writeToCurrentOutput("<br>"); return; }
+    if (name == "nobreak")    { writeToCurrentOutput("&nbsp;"); return; }
+    if (name == "zwbo")       { writeToCurrentOutput("&#x200B;"); return; }
+    if (name == "chdate")     { writeToCurrentOutput("<time>[DATE]</time>"); return; }
+    if (name == "chtime")     { writeToCurrentOutput("<time>[TIME]</time>"); return; }
+    if (name == "column")     { writeToCurrentOutput("<br>"); return; } // Feature 11
+    // Feature 12：特殊域字段输出（当作为单独控制字出现时）
+    if (name == "date")       { writeToCurrentOutput("<time>[DATE]</time>"); return; }
+    if (name == "time")       { writeToCurrentOutput("<time>[TIME]</time>"); return; }
 }
 
 // ============================================================
@@ -883,13 +1210,17 @@ void Converter::handleControlSymbol(const Token& tok) {
 // ============================================================
 void Converter::handleHexChar(const Token& tok) {
     if (curState_.skipGroup) return;
+    // Feature 3：非组形式 htmlrtf 跳过
+    if (htmlRtfInlineSkip_) return;
 
     if (unicodeSkipCount_ > 0) {
         --unicodeSkipCount_;
+        // DBCS 前导字节在跳过时也需要清除
+        dbcsLeadByte_ = 0;
         return;
     }
 
-    unsigned char byte = tok.hexByte;
+    uint8_t byte = tok.hexByte;
     int cp = curState_.cs.fontCodepage > 0 ? curState_.cs.fontCodepage : docCodepage_;
 
     switch (curState_.dest) {
@@ -898,7 +1229,7 @@ void Converter::handleHexChar(const Token& tok) {
             break;
 
         case Destination::FontEntry: {
-            // 字体名称中的字符
+            // 字体名称中的字符（字体名不涉及 DBCS）
             std::string ch = cpToUtf8(byte, cp);
             currentFontEntry_.name += ch;
             break;
@@ -923,11 +1254,42 @@ void Converter::handleHexChar(const Token& tok) {
         case Destination::HtmlRtf:
         case Destination::MhtmlTag:
         case Destination::StyleSheet:
+        case Destination::StyleEntry:
+        case Destination::BookmarkEnd:
+            break;
+
+        case Destination::BookmarkStart:
+            // Feature 20：收集书签名称
+            if (!fromHtml_) {
+                bookmarkNameBuffer_ += cpToUtf8(byte, cp);
+            }
+            break;
+
+        case Destination::Footnote:
+        case Destination::Endnote:
+            // Feature 10：收集脚注内容
+            if (collectingFootnote_) {
+                footnoteBuffer_ += htmlEscape(cpToUtf8(byte, cp));
+            }
             break;
 
         default: {
-            std::string decoded = cpToUtf8(byte, cp);
-            writeToCurrentOutput(htmlEscape(decoded));
+            // Feature 1：DBCS 多字节编码处理
+            // 注意：必须先检查 dbcsLeadByte_ != 0，因为 GBK/Big5 的跟随字节
+            // 范围与前导字节范围有重叠（如 GBK 跟随字节 0xE3 也在前导字节范围内）
+            if (dbcsLeadByte_ != 0) {
+                // 已有前导字节在缓存，当前字节是跟随字节
+                std::string decoded = dbcsPairToUtf8(dbcsLeadByte_, byte, cp);
+                dbcsLeadByte_ = 0;
+                writeToCurrentOutput(htmlEscape(decoded));
+            } else if (isDbcsLeadByte(byte, cp)) {
+                // 这是前导字节，缓存它，等待跟随字节
+                dbcsLeadByte_ = byte;
+            } else {
+                // 单字节字符
+                std::string decoded = cpToUtf8(byte, cp);
+                writeToCurrentOutput(htmlEscape(decoded));
+            }
             break;
         }
     }
@@ -938,6 +1300,8 @@ void Converter::handleHexChar(const Token& tok) {
 // ============================================================
 void Converter::handleText(const Token& tok) {
     if (curState_.skipGroup) return;
+    // Feature 3：非组形式 htmlrtf 跳过
+    if (htmlRtfInlineSkip_) return;
 
     const std::string& text = tok.text;
     if (text.empty()) return;
@@ -1022,13 +1386,46 @@ void Converter::handleText(const Token& tok) {
             listTextBuffer_ += text;
             return;
 
+        case Destination::StyleEntry:
+            // Feature 2：收集样式名称（以 ; 结尾）
+            {
+                for (char c : text) {
+                    if (c == ';') {
+                        // 样式名称结束
+                        currentStyle_.name = styleNameBuffer_;
+                        styleNameBuffer_.clear();
+                    } else {
+                        styleNameBuffer_ += c;
+                    }
+                }
+            }
+            return;
+
+        case Destination::BookmarkStart:
+            // Feature 20：收集书签名称
+            if (!fromHtml_) {
+                for (char c : text) {
+                    if (c != ';') bookmarkNameBuffer_ += c;
+                }
+            }
+            return;
+
+        case Destination::BookmarkEnd:
+            return;
+
+        case Destination::Footnote:
+        case Destination::Endnote:
+            // Feature 10：收集脚注文本
+            if (collectingFootnote_) {
+                footnoteBuffer_ += htmlEscape(text);
+            }
+            return;
+
         case Destination::Skip:
         case Destination::Info:
         case Destination::HtmlRtf:
         case Destination::MhtmlTag:
         case Destination::StyleSheet:
-        case Destination::StyleEntry:
-        case Destination::Bookmark:
             return;
 
         default: {
@@ -1061,6 +1458,15 @@ void Converter::handleText(const Token& tok) {
 // ============================================================
 void Converter::writeToCurrentOutput(const std::string& s) {
     if (s.empty() || curState_.skipGroup) return;
+    // Feature 3：非组形式 htmlrtf 跳过
+    if (htmlRtfInlineSkip_) return;
+    // Feature 10：脚注内容写入脚注缓冲
+    if (collectingFootnote_ &&
+        (curState_.dest == Destination::Footnote ||
+         curState_.dest == Destination::Endnote)) {
+        footnoteBuffer_ += s;
+        return;
+    }
 
     // HtmlTag 目标
     if (curState_.dest == Destination::HtmlTag) {
@@ -1236,6 +1642,25 @@ std::string Converter::buildSpanCss() const {
         css << "letter-spacing:" << spacingPt << "pt;";
     }
 
+    // Feature 14：特殊文字效果
+    if (cs.outline) {
+        css << "-webkit-text-stroke:1px #000;color:transparent;";
+    }
+    if (cs.shadow) {
+        css << "text-shadow:2px 2px 3px rgba(0,0,0,0.5);";
+    }
+    if (cs.emboss) {
+        css << "text-shadow:1px 1px 0 #fff,-1px -1px 0 #888;";
+    }
+    if (cs.engrave) {
+        css << "text-shadow:-1px -1px 0 #fff,1px 1px 0 #888;";
+    }
+
+    // Feature 9：字符方向
+    if (cs.rtl) {
+        css << "direction:rtl;unicode-bidi:bidi-override;";
+    }
+
     return css.str();
 }
 
@@ -1272,6 +1697,79 @@ std::string Converter::buildParaCss() const {
             css << "line-height:" << lhPt << "pt;";
         }
     }
+
+    // Feature 9：段落方向
+    if (ps.rtlPar) {
+        css << "direction:rtl;";
+    }
+
+    // Feature 11：分页
+    if (ps.pageBreakBefore) {
+        css << "page-break-before:always;";
+    }
+
+    // Feature 8：段落边框
+    auto borderStyleCss = [](int style) -> std::string {
+        switch (style) {
+            case 1: return "thick";
+            case 2: return "double";
+            case 3: return "dotted";
+            case 4: return "dashed";
+            default: return "solid";
+        }
+    };
+    if (ps.border.box) {
+        double w = std::max(1.0, ps.border.width / 20.0);
+        css << "border:" << w << "pt " << borderStyleCss(ps.border.style) << " ";
+        if (ps.border.colorIndex > 0 && ps.border.colorIndex < (int)colorTable_.size()
+            && !colorTable_[ps.border.colorIndex].isAuto)
+            css << colorToHex(ps.border.colorIndex);
+        else
+            css << "#000";
+        css << ";padding:4px;";
+    } else {
+        double w = std::max(1.0, ps.border.width / 20.0);
+        std::string bcolor = "#000";
+        if (ps.border.colorIndex > 0 && ps.border.colorIndex < (int)colorTable_.size()
+            && !colorTable_[ps.border.colorIndex].isAuto)
+            bcolor = colorToHex(ps.border.colorIndex);
+        std::string bstyle = borderStyleCss(ps.border.style);
+        if (ps.border.left)
+            css << "border-left:" << w << "pt " << bstyle << " " << bcolor << ";";
+        if (ps.border.right)
+            css << "border-right:" << w << "pt " << bstyle << " " << bcolor << ";";
+        if (ps.border.top)
+            css << "border-top:" << w << "pt " << bstyle << " " << bcolor << ";";
+        if (ps.border.bottom)
+            css << "border-bottom:" << w << "pt " << bstyle << " " << bcolor << ";";
+    }
+
+    // Feature 15：段落底纹
+    if (ps.shadingPct > 0) {
+        // 混合前景色和背景色
+        int fgR = 0, fgG = 0, fgB = 0;   // 默认黑色前景
+        int bgR = 255, bgG = 255, bgB = 255; // 默认白色背景
+        if (ps.shadingFgColor > 0 && ps.shadingFgColor < (int)colorTable_.size()
+            && !colorTable_[ps.shadingFgColor].isAuto) {
+            fgR = colorTable_[ps.shadingFgColor].r;
+            fgG = colorTable_[ps.shadingFgColor].g;
+            fgB = colorTable_[ps.shadingFgColor].b;
+        }
+        if (ps.shadingBgColor > 0 && ps.shadingBgColor < (int)colorTable_.size()
+            && !colorTable_[ps.shadingBgColor].isAuto) {
+            bgR = colorTable_[ps.shadingBgColor].r;
+            bgG = colorTable_[ps.shadingBgColor].g;
+            bgB = colorTable_[ps.shadingBgColor].b;
+        }
+        double pct = ps.shadingPct / 100.0;
+        int mixR = static_cast<int>(fgR * pct + bgR * (1.0 - pct));
+        int mixG = static_cast<int>(fgG * pct + bgG * (1.0 - pct));
+        int mixB = static_cast<int>(fgB * pct + bgB * (1.0 - pct));
+        char buf[24];
+        std::snprintf(buf, sizeof(buf), "#%02x%02x%02x", mixR, mixG, mixB);
+        css << "background-color:" << buf << ";";
+    }
+
     return css.str();
 }
 
@@ -1280,11 +1778,31 @@ std::string Converter::buildParaCss() const {
 // ============================================================
 void Converter::openParagraph() {
     if (paraOpen_ || fromHtml_) return;
+
+    // Feature 2：根据 outlinelevel 或样式名决定标签类型
+    int outlineLevel = curState_.ps.outlineLevel;
+    // 如果段落状态没有直接设置 outlinelevel，检查样式表
+    if (outlineLevel < 0 && curState_.ps.styleIndex > 0) {
+        auto it = styleTable_.find(curState_.ps.styleIndex);
+        if (it != styleTable_.end()) {
+            outlineLevel = it->second.outlineLevel;
+        }
+    }
+
+    std::string tag = "p";
+    if (outlineLevel >= 0 && outlineLevel <= 5) {
+        tag = "h" + std::to_string(outlineLevel + 1);
+    }
+
     std::string css = buildParaCss();
     if (!css.empty())
-        html_ << "<p style=\"" << css << "\">";
+        html_ << "<" << tag << " style=\"" << css << "\">";
     else
-        html_ << "<p>";
+        html_ << "<" << tag << ">";
+
+    // 存储当前使用的标签（用于关闭）
+    // 通过 paraOpen_ 保存标签类型到全局变量
+    currentParaTag_ = tag;
     paraOpen_ = true;
     spanOpen_ = false;
     currentSpanCss_.clear();
@@ -1296,8 +1814,10 @@ void Converter::openParagraph() {
 void Converter::closeParagraph() {
     if (!paraOpen_ || fromHtml_) return;
     ensureSpanClosed();
-    html_ << "</p>\n";
+    // Feature 2：使用对应的闭合标签
+    html_ << "</" << currentParaTag_ << ">\n";
     paraOpen_ = false;
+    currentParaTag_ = "p"; // 重置为默认
 }
 
 // ============================================================
@@ -1450,27 +1970,33 @@ void Converter::flushRow() {
 // ============================================================
 // 输出图片
 // ============================================================
+// 将十六进制字符串转二进制数组
+std::vector<uint8_t> Converter::hexToBinary(const std::string& hex) {
+    std::vector<uint8_t> result;
+    result.reserve(hex.size() / 2);
+    auto hexVal = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    for (size_t i = 0; i + 1 < hex.size(); i += 2) {
+        int hi = hexVal(hex[i]);
+        int lo = hexVal(hex[i+1]);
+        if (hi >= 0 && lo >= 0) {
+            result.push_back(static_cast<uint8_t>(hi * 16 + lo));
+        }
+    }
+    return result;
+}
+
 void Converter::emitPict() {
     if (pict_.format.empty()) return;
 
-    bool isSupportedFormat = (pict_.format == "png" || pict_.format == "jpeg");
-    if (!isSupportedFormat) return;
-
     // 将十六进制字符串转二进制
-    std::vector<uint8_t> imgData;
-    const std::string& hex = pict_.hexData;
-    imgData.reserve(hex.size() / 2);
-    for (size_t i = 0; i + 1 < hex.size(); i += 2) {
-        auto hexVal = [](char c) -> int {
-            if (c >= '0' && c <= '9') return c - '0';
-            if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-            if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-            return 0;
-        };
-        imgData.push_back(static_cast<uint8_t>(hexVal(hex[i]) * 16 + hexVal(hex[i+1])));
-    }
+    std::vector<uint8_t> imgData = hexToBinary(pict_.hexData);
 
-    // 合并二进制数据
+    // 合并二进制数据（\binN 方式）
     if (!pict_.binData.empty()) {
         imgData.insert(imgData.end(), pict_.binData.begin(), pict_.binData.end());
     }
@@ -1483,6 +2009,112 @@ void Converter::emitPict() {
         return;
     }
 
+    // 计算显示尺寸（twips 转像素）
+    int dispW = pict_.widthGoal > 0 ? pict_.widthGoal : pict_.width;
+    int dispH = pict_.heightGoal > 0 ? pict_.heightGoal : pict_.height;
+    if (pict_.scaleX != 100 && dispW > 0) dispW = dispW * pict_.scaleX / 100;
+    if (pict_.scaleY != 100 && dispH > 0) dispH = dispH * pict_.scaleY / 100;
+    int wPx = dispW > 0 ? (int)twipsToPx(dispW) : 0;
+    int hPx = dispH > 0 ? (int)twipsToPx(dispH) : 0;
+
+    // Feature 6：WMF/EMF 处理
+    if (pict_.format == "wmf" || pict_.format == "emf") {
+        // 策略1：扫描数据中是否内嵌了 JPEG 或 PNG
+        bool foundRaster = false;
+        for (size_t i = 0; i + 3 < imgData.size(); ++i) {
+            // 检查 JPEG 魔数：FF D8 FF
+            if (imgData[i] == 0xFF && imgData[i+1] == 0xD8 && imgData[i+2] == 0xFF) {
+                std::vector<uint8_t> jpegData(imgData.begin() + i, imgData.end());
+                if (!opts_.embedImages) {
+                    writeToCurrentOutput("<span>[图片]</span>");
+                    return;
+                }
+                std::string b64 = toBase64(jpegData);
+                std::ostringstream sizeAttr;
+                if (wPx > 0) sizeAttr << " width=\"" << wPx << "\"";
+                if (hPx > 0) sizeAttr << " height=\"" << hPx << "\"";
+                std::string imgTag = "<img src=\"data:image/jpeg;base64," + b64 + "\""
+                    + sizeAttr.str() + " alt=\"\" style=\"max-width:100%;\">";
+                if (curState_.ps.inTable && table_.active)
+                    table_.currentCellContent += imgTag;
+                else {
+                    if (!paraOpen_ && !fromHtml_) openParagraph();
+                    html_ << imgTag;
+                }
+                foundRaster = true;
+                break;
+            }
+            // 检查 PNG 魔数：89 50 4E 47
+            if (imgData[i] == 0x89 && imgData[i+1] == 0x50 &&
+                imgData[i+2] == 0x4E && imgData[i+3] == 0x47) {
+                std::vector<uint8_t> pngData(imgData.begin() + i, imgData.end());
+                if (!opts_.embedImages) {
+                    writeToCurrentOutput("<span>[图片]</span>");
+                    return;
+                }
+                std::string b64 = toBase64(pngData);
+                std::ostringstream sizeAttr;
+                if (wPx > 0) sizeAttr << " width=\"" << wPx << "\"";
+                if (hPx > 0) sizeAttr << " height=\"" << hPx << "\"";
+                std::string imgTag = "<img src=\"data:image/png;base64," + b64 + "\""
+                    + sizeAttr.str() + " alt=\"\" style=\"max-width:100%;\">";
+                if (curState_.ps.inTable && table_.active)
+                    table_.currentCellContent += imgTag;
+                else {
+                    if (!paraOpen_ && !fromHtml_) openParagraph();
+                    html_ << imgTag;
+                }
+                foundRaster = true;
+                break;
+            }
+        }
+        if (!foundRaster) {
+            // 策略2：输出占位符
+            std::ostringstream ph;
+            ph << "<img";
+            if (wPx > 0) ph << " width=\"" << wPx << "\"";
+            if (hPx > 0) ph << " height=\"" << hPx << "\"";
+            ph << " alt=\"[矢量图]\" style=\"";
+            if (wPx > 0) ph << "width:" << wPx << "px;";
+            if (hPx > 0) ph << "height:" << hPx << "px;";
+            ph << "background:#f0f0f0;display:inline-block;"
+               << "border:1px solid #ccc;vertical-align:middle;\">";
+            if (curState_.ps.inTable && table_.active)
+                table_.currentCellContent += ph.str();
+            else {
+                if (!paraOpen_ && !fromHtml_) openParagraph();
+                html_ << ph.str();
+            }
+        }
+        return;
+    }
+
+    // Feature 7：BMP/DIB 处理
+    if (pict_.format == "bmp") {
+        std::vector<uint8_t> pngData = dibToPng(imgData);
+        if (!pngData.empty() && opts_.embedImages) {
+            std::string b64 = toBase64(pngData);
+            std::ostringstream sizeAttr;
+            if (wPx > 0) sizeAttr << " width=\"" << wPx << "\"";
+            if (hPx > 0) sizeAttr << " height=\"" << hPx << "\"";
+            std::string imgTag = "<img src=\"data:image/png;base64," + b64 + "\""
+                + sizeAttr.str() + " alt=\"\" style=\"max-width:100%;\">";
+            if (curState_.ps.inTable && table_.active)
+                table_.currentCellContent += imgTag;
+            else {
+                if (!paraOpen_ && !fromHtml_) openParagraph();
+                html_ << imgTag;
+            }
+        } else if (!opts_.embedImages) {
+            writeToCurrentOutput("<span>[图片]</span>");
+        }
+        return;
+    }
+
+    // PNG/JPEG 标准格式
+    bool isSupportedFormat = (pict_.format == "png" || pict_.format == "jpeg");
+    if (!isSupportedFormat) return;
+
     if (!opts_.embedImages) {
         writeToCurrentOutput("<span>[图片]</span>");
         return;
@@ -1491,14 +2123,9 @@ void Converter::emitPict() {
     std::string b64 = toBase64(imgData);
     std::string mimeType = (pict_.format == "jpeg") ? "image/jpeg" : "image/png";
 
-    // 计算显示尺寸（twips 转像素）
     std::ostringstream sizeAttr;
-    int dispW = pict_.widthGoal > 0 ? pict_.widthGoal : pict_.width;
-    int dispH = pict_.heightGoal > 0 ? pict_.heightGoal : pict_.height;
-    if (pict_.scaleX != 100 && dispW > 0) dispW = dispW * pict_.scaleX / 100;
-    if (pict_.scaleY != 100 && dispH > 0) dispH = dispH * pict_.scaleY / 100;
-    if (dispW > 0) sizeAttr << " width=\"" << (int)twipsToPx(dispW) << "\"";
-    if (dispH > 0) sizeAttr << " height=\"" << (int)twipsToPx(dispH) << "\"";
+    if (wPx > 0) sizeAttr << " width=\"" << wPx << "\"";
+    if (hPx > 0) sizeAttr << " height=\"" << hPx << "\"";
 
     std::string imgTag = "<img src=\"data:" + mimeType + ";base64," + b64 + "\""
                        + sizeAttr.str() + " alt=\"\" style=\"max-width:100%;\">";
@@ -1510,6 +2137,212 @@ void Converter::emitPict() {
         if (!paraOpen_ && !fromHtml_) openParagraph();
         html_ << imgTag;
     }
+}
+
+// ============================================================
+// Feature 7：DIB/BMP 转 PNG（无压缩 PNG）
+// ============================================================
+std::vector<uint8_t> Converter::dibToPng(const std::vector<uint8_t>& dibData) {
+    if (dibData.size() < 40) return {}; // BITMAPINFOHEADER 最小为 40 字节
+
+    // 解析 BITMAPINFOHEADER
+    auto readU32LE = [&](size_t off) -> uint32_t {
+        if (off + 4 > dibData.size()) return 0;
+        return (uint32_t)dibData[off] | ((uint32_t)dibData[off+1] << 8)
+             | ((uint32_t)dibData[off+2] << 16) | ((uint32_t)dibData[off+3] << 24);
+    };
+    auto readU16LE = [&](size_t off) -> uint16_t {
+        if (off + 2 > dibData.size()) return 0;
+        return (uint16_t)dibData[off] | ((uint16_t)dibData[off+1] << 8);
+    };
+
+    uint32_t biSize       = readU32LE(0);
+    int32_t  biWidth      = (int32_t)readU32LE(4);
+    int32_t  biHeight     = (int32_t)readU32LE(8);
+    uint16_t biBitCount   = readU16LE(14);
+    uint32_t biCompression= readU32LE(16);
+
+    // 只支持未压缩格式
+    if (biCompression != 0) return {};
+    if (biWidth <= 0) return {};
+    // 高度为负表示自上到下，正表示自下到上
+    bool topDown = (biHeight < 0);
+    int height = topDown ? -((int32_t)biHeight) : (int32_t)biHeight;
+    int width  = biWidth;
+
+    // 颜色表数量
+    size_t colorTableCount = 0;
+    if (biBitCount <= 8) colorTableCount = (size_t(1) << biBitCount);
+    size_t colorTableSize = colorTableCount * 4;
+    size_t pixelDataOff = biSize + colorTableSize;
+
+    if (pixelDataOff >= dibData.size()) return {};
+
+    // 每行字节数（4字节对齐）
+    size_t rowBytes = ((size_t)width * biBitCount + 31) / 32 * 4;
+
+    // 生成 PNG（无压缩）
+    // PNG 使用 zlib DEFLATE（BTYPE=00：存储块）包装扫描线
+    // 每个扫描线前面有一个过滤器字节（0=None）
+
+    // 构建 PNG 辅助函数
+    auto crc32 = [](const uint8_t* data, size_t len) -> uint32_t {
+        static uint32_t table[256];
+        static bool init = false;
+        if (!init) {
+            for (uint32_t i = 0; i < 256; ++i) {
+                uint32_t c = i;
+                for (int k = 0; k < 8; ++k)
+                    c = (c & 1) ? (0xEDB88320 ^ (c >> 1)) : (c >> 1);
+                table[i] = c;
+            }
+            init = true;
+        }
+        uint32_t c = 0xFFFFFFFF;
+        for (size_t i = 0; i < len; ++i) c = table[(c ^ data[i]) & 0xFF] ^ (c >> 8);
+        return c ^ 0xFFFFFFFF;
+    };
+
+    auto adler32 = [](const uint8_t* data, size_t len) -> uint32_t {
+        uint32_t a = 1, b = 0;
+        for (size_t i = 0; i < len; ++i) {
+            a = (a + data[i]) % 65521;
+            b = (b + a) % 65521;
+        }
+        return (b << 16) | a;
+    };
+
+    auto writeU32BE = [](std::vector<uint8_t>& v, uint32_t val) {
+        v.push_back((val >> 24) & 0xFF);
+        v.push_back((val >> 16) & 0xFF);
+        v.push_back((val >>  8) & 0xFF);
+        v.push_back( val        & 0xFF);
+    };
+
+    auto writePngChunk = [&](std::vector<uint8_t>& png,
+                              const char* type, const std::vector<uint8_t>& chunkData) {
+        writeU32BE(png, (uint32_t)chunkData.size());
+        png.push_back((uint8_t)type[0]); png.push_back((uint8_t)type[1]);
+        png.push_back((uint8_t)type[2]); png.push_back((uint8_t)type[3]);
+        png.insert(png.end(), chunkData.begin(), chunkData.end());
+        // CRC 覆盖 type + data
+        std::vector<uint8_t> crcInput;
+        crcInput.push_back((uint8_t)type[0]); crcInput.push_back((uint8_t)type[1]);
+        crcInput.push_back((uint8_t)type[2]); crcInput.push_back((uint8_t)type[3]);
+        crcInput.insert(crcInput.end(), chunkData.begin(), chunkData.end());
+        writeU32BE(png, crc32(crcInput.data(), crcInput.size()));
+    };
+
+    std::vector<uint8_t> png;
+
+    // PNG 签名
+    static const uint8_t pngSig[] = {0x89,0x50,0x4E,0x47,0x0D,0x0A,0x1A,0x0A};
+    png.insert(png.end(), pngSig, pngSig + 8);
+
+    // IHDR 块（颜色类型 2=RGB, 6=RGBA）
+    // 使用 RGB 输出（24位），palette 模式也转为 RGB
+    {
+        std::vector<uint8_t> ihdr(13);
+        ihdr[0]  = (width >> 24) & 0xFF; ihdr[1]  = (width >> 16) & 0xFF;
+        ihdr[2]  = (width >>  8) & 0xFF; ihdr[3]  =  width        & 0xFF;
+        ihdr[4]  = (height >> 24) & 0xFF; ihdr[5]  = (height >> 16) & 0xFF;
+        ihdr[6]  = (height >>  8) & 0xFF; ihdr[7]  =  height        & 0xFF;
+        ihdr[8]  = 8;  // 位深度
+        ihdr[9]  = 2;  // 颜色类型 RGB
+        ihdr[10] = 0;  // 压缩方法 deflate
+        ihdr[11] = 0;  // 过滤方法
+        ihdr[12] = 0;  // 扫描方法（不隔行）
+        writePngChunk(png, "IHDR", ihdr);
+    }
+
+    // 构建 RGB 扫描线数据（含过滤字节）
+    std::vector<uint8_t> rawData;
+    rawData.reserve((size_t)(width * 3 + 1) * height);
+
+    auto getColor = [&](int x, int y) -> std::tuple<uint8_t, uint8_t, uint8_t> {
+        // DIB 底部行优先（topDown=false 时 y=0 对应最底行）
+        int srcRow = topDown ? y : (height - 1 - y);
+        size_t rowOff = pixelDataOff + (size_t)srcRow * rowBytes;
+        if (rowOff >= dibData.size())
+            return std::make_tuple(uint8_t(0), uint8_t(0), uint8_t(0));
+
+        if (biBitCount == 24) {
+            size_t pOff = rowOff + (size_t)x * 3;
+            if (pOff + 2 >= dibData.size())
+                return std::make_tuple(uint8_t(0), uint8_t(0), uint8_t(0));
+            uint8_t b = dibData[pOff], g = dibData[pOff+1], r = dibData[pOff+2];
+            return std::make_tuple(r, g, b);
+        } else if (biBitCount == 32) {
+            size_t pOff = rowOff + (size_t)x * 4;
+            if (pOff + 2 >= dibData.size())
+                return std::make_tuple(uint8_t(0), uint8_t(0), uint8_t(0));
+            uint8_t b = dibData[pOff], g = dibData[pOff+1], r = dibData[pOff+2];
+            return std::make_tuple(r, g, b);
+        } else if (biBitCount == 8 && colorTableCount > 0) {
+            size_t pOff = rowOff + (size_t)x;
+            if (pOff >= dibData.size())
+                return std::make_tuple(uint8_t(0), uint8_t(0), uint8_t(0));
+            uint8_t idx = dibData[pOff];
+            size_t ctOff = biSize + (size_t)idx * 4;
+            if (ctOff + 2 >= dibData.size())
+                return std::make_tuple(uint8_t(0), uint8_t(0), uint8_t(0));
+            uint8_t b = dibData[ctOff], g = dibData[ctOff+1], r = dibData[ctOff+2];
+            return std::make_tuple(r, g, b);
+        }
+        return std::make_tuple(uint8_t(128), uint8_t(128), uint8_t(128)); // 不支持的位深度
+    };
+
+    for (int y = 0; y < height; ++y) {
+        rawData.push_back(0); // 过滤器字节 0 = None
+        for (int x = 0; x < width; ++x) {
+            auto color = getColor(x, y);
+            rawData.push_back(std::get<0>(color));
+            rawData.push_back(std::get<1>(color));
+            rawData.push_back(std::get<2>(color));
+        }
+    }
+
+    // 使用 zlib 存储（非压缩）包装原始数据
+    // zlib 格式：2字节头 + 一个或多个 DEFLATE 存储块 + 4字节 Adler-32
+    std::vector<uint8_t> zdata;
+    zdata.push_back(0x78); // CMF: deflate, window=32k
+    zdata.push_back(0x01); // FLG: no dict, level 0 (fastest)
+
+    // DEFLATE 存储块：每块最多 65535 字节
+    size_t rawSize = rawData.size();
+    size_t offset = 0;
+    while (offset < rawSize) {
+        size_t blockSize = std::min((size_t)65535, rawSize - offset);
+        bool lastBlock = (offset + blockSize >= rawSize);
+        // BFINAL + BTYPE=00（存储）
+        zdata.push_back(lastBlock ? 0x01 : 0x00);
+        // LEN (小端)
+        zdata.push_back((uint8_t)(blockSize & 0xFF));
+        zdata.push_back((uint8_t)((blockSize >> 8) & 0xFF));
+        // NLEN（LEN 的补码）
+        uint16_t nlen = (uint16_t)(~blockSize);
+        zdata.push_back((uint8_t)(nlen & 0xFF));
+        zdata.push_back((uint8_t)((nlen >> 8) & 0xFF));
+        // 数据
+        zdata.insert(zdata.end(), rawData.begin() + offset,
+                                  rawData.begin() + offset + blockSize);
+        offset += blockSize;
+    }
+
+    // Adler-32 校验（大端）
+    uint32_t adler = adler32(rawData.data(), rawData.size());
+    zdata.push_back((adler >> 24) & 0xFF);
+    zdata.push_back((adler >> 16) & 0xFF);
+    zdata.push_back((adler >>  8) & 0xFF);
+    zdata.push_back( adler        & 0xFF);
+
+    // IDAT 块
+    writePngChunk(png, "IDAT", zdata);
+
+    // IEND 块
+    writePngChunk(png, "IEND", {});
+
+    return png;
 }
 
 // ============================================================
@@ -1547,7 +2380,94 @@ std::string Converter::toBase64(const std::vector<uint8_t>& data) {
 }
 
 // ============================================================
-// 从 \fldinst 提取超链接 URL
+// Feature 12：提取域指令内容，识别域类型
+// ============================================================
+std::string Converter::extractFieldContent(const std::string& instText, std::string& fieldType) {
+    // 去掉首尾空白
+    size_t s = instText.find_first_not_of(" \t\r\n");
+    if (s == std::string::npos) { fieldType = ""; return ""; }
+    std::string t = instText.substr(s);
+
+    // 提取域类型（大写）
+    size_t spacePos = t.find_first_of(" \t\r\n");
+    std::string typeRaw = (spacePos != std::string::npos) ? t.substr(0, spacePos) : t;
+    fieldType.resize(typeRaw.size());
+    std::transform(typeRaw.begin(), typeRaw.end(), fieldType.begin(),
+                   [](unsigned char c) { return (char)std::toupper(c); });
+
+    std::string rest = (spacePos != std::string::npos) ? t.substr(spacePos) : "";
+    // 去掉 rest 前的空白
+    size_t rs = rest.find_first_not_of(" \t\r\n");
+    if (rs != std::string::npos) rest = rest.substr(rs);
+
+    if (fieldType == "HYPERLINK") {
+        // 检查是否有 \l 本地锚点
+        std::string url;
+        bool hasLocal = false;
+        // 先提取引号内的 URL
+        if (!rest.empty() && rest[0] == '"') {
+            size_t end = rest.find('"', 1);
+            if (end != std::string::npos) url = rest.substr(1, end - 1);
+        } else {
+            size_t endPos = rest.find_first_of(" \t\r\n\\");
+            url = (endPos != std::string::npos) ? rest.substr(0, endPos) : rest;
+        }
+        // 检查 \l 参数
+        size_t lPos = rest.find("\\l");
+        if (lPos != std::string::npos) {
+            std::string afterL = rest.substr(lPos + 2);
+            size_t ls2 = afterL.find_first_not_of(" \t");
+            if (ls2 != std::string::npos) {
+                afterL = afterL.substr(ls2);
+                std::string anchor;
+                if (!afterL.empty() && afterL[0] == '"') {
+                    size_t ae = afterL.find('"', 1);
+                    if (ae != std::string::npos) anchor = afterL.substr(1, ae - 1);
+                } else {
+                    size_t ae = afterL.find_first_of(" \t\r\n\\");
+                    anchor = (ae != std::string::npos) ? afterL.substr(0, ae) : afterL;
+                }
+                if (!anchor.empty()) {
+                    hasLocal = true;
+                    if (url.empty()) url = "#" + anchor;
+                    else url += "#" + anchor;
+                }
+            }
+        }
+        // 检查 \o 提示
+        // （提示暂不在 extractFieldContent 中处理，需要在调用方处理）
+        return url;
+    } else if (fieldType == "REF") {
+        // 提取书签名
+        if (!rest.empty() && rest[0] == '"') {
+            size_t end = rest.find('"', 1);
+            if (end != std::string::npos) return rest.substr(1, end - 1);
+        }
+        size_t endPos = rest.find_first_of(" \t\r\n\\");
+        return (endPos != std::string::npos) ? rest.substr(0, endPos) : rest;
+    } else if (fieldType == "INCLUDEPICTURE") {
+        if (!rest.empty() && rest[0] == '"') {
+            size_t end = rest.find('"', 1);
+            if (end != std::string::npos) return rest.substr(1, end - 1);
+        }
+        return rest;
+    } else if (fieldType == "MAILTO") {
+        if (!rest.empty() && rest[0] == '"') {
+            size_t end = rest.find('"', 1);
+            if (end != std::string::npos) return rest.substr(1, end - 1);
+        }
+        return rest;
+    } else if (fieldType == "DATE" || fieldType == "TIME") {
+        return "";
+    } else if (fieldType == "PAGE" || fieldType == "NUMPAGES") {
+        return "";
+    }
+
+    return rest;
+}
+
+// ============================================================
+// 从 \fldinst 提取超链接 URL（保持向后兼容）
 // ============================================================
 std::string Converter::extractHyperlink(const std::string& instText) {
     std::string t = instText;
@@ -1689,6 +2609,26 @@ void Converter::closeListsToLevel(int targetLevel) {
         const ListOutputState& ls = listStack_.back();
         html_ << (ls.isOrdered ? "</ol>\n" : "</ul>\n");
         listStack_.pop_back();
+    }
+}
+
+// ============================================================
+// Feature 10：输出脚注/尾注区
+// ============================================================
+void Converter::emitFootnotes() {
+    if (!footnotes_.empty()) {
+        html_ << "<hr>\n<section class=\"footnotes\"><h4>脚注</h4>\n";
+        for (const auto& fn : footnotes_) {
+            html_ << fn;
+        }
+        html_ << "</section>\n";
+    }
+    if (!endnotes_.empty()) {
+        html_ << "<hr>\n<section class=\"endnotes\"><h4>尾注</h4>\n";
+        for (const auto& en : endnotes_) {
+            html_ << en;
+        }
+        html_ << "</section>\n";
     }
 }
 
