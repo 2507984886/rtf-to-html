@@ -1,0 +1,4 @@
+# 预编译二进制文件
+bin/**/*.exe binary
+bin/**/*.dll binary
+bin/**/*.lib binary
